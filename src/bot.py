@@ -73,7 +73,7 @@ class DutchVocabBot:
         
         # Create main menu keyboard
         keyboard = [
-            [InlineKeyboardButton("Start Learning", callback_data="start_learning")],
+            [InlineKeyboardButton("Next Word", callback_data="next_word")],
             [InlineKeyboardButton("View Progress", callback_data="view_progress")],
             [InlineKeyboardButton("Add Word", callback_data="add_word_menu")],
         ]
@@ -81,7 +81,7 @@ class DutchVocabBot:
         
         await update.message.reply_text(
             f"Welcome to Dutch Vocabulary Trainer, {user.username}! 🇳🇱\n\n"
-            "I'll help you learn Dutch words using adaptive exercises and spaced repetition.",
+            "I'll help you learn Dutch words using adaptive exercises and spaced repetition. You're always in learning mode - just hit 'Next Word' to continue!",
             reply_markup=reply_markup
         )
     
@@ -92,31 +92,29 @@ class DutchVocabBot:
             
         await query.answer()
         
-        if query.data == "start_learning":
-            await self.start_learning_session(query, context)
+        if query.data == "next_word":
+            await self.get_next_word(query, context)
         elif query.data == "view_progress":
             await self.show_progress(query, context)
         elif query.data == "add_word_menu":
             await self.show_add_word_menu(query, context)
         elif query.data.startswith("exercise_"):
             await self.handle_exercise_response(query, context)
-        elif query.data == "next_word":
-            await self.start_learning_session(query, context)
-        elif query.data == "finish_session":
-            await self.finish_learning_session(query, context)
+        elif query.data == "remove_word":
+            await self.remove_current_word(query, context)
         elif query.data == "back_to_menu":
             await self.show_main_menu(query, context)
     
-    async def start_learning_session(self, query, context):
+    async def get_next_word(self, query, context):
         """
-        Start a new learning session with adaptive word selection and exercise type optimization.
+        Get next word for continuous learning with adaptive word selection and exercise type optimization.
         
-        Learning Session Flow:
+        Continuous Learning Flow:
         1. Use SpacedRepetitionManager to select next word (due words prioritized)
         2. Use ContextualBandits ML to select optimal exercise type for the word
         3. Generate exercise (multiple choice or translation)
-        4. Track session progress (max 10 words per session)
-        5. Store exercise context for response handling
+        4. Store exercise context for response handling
+        5. Track progress and retrain models every 10 words
         
         The system adapts to user performance:
         - Words are scheduled using SM-2 spaced repetition algorithm
@@ -143,32 +141,21 @@ class DutchVocabBot:
             # Generate exercise
             exercise_data = self.exercise_manager.generate_exercise(db, next_word, exercise_type)
             
-            # Store current exercise in context and track session
+            # Store current exercise in context
             context.user_data['current_word_id'] = next_word.id
             context.user_data['current_exercise_type'] = exercise_type
             context.user_data['exercise_start_time'] = datetime.now()
             
-            # Initialize or increment session counter
-            session_count = context.user_data.get('session_count', 0) + 1
-            context.user_data['session_count'] = session_count
+            # Store current word for potential removal
+            context.user_data['current_word_dutch'] = next_word.dutch_word
+            context.user_data['current_word_english'] = next_word.english_translation
             
-            # Check if session limit reached
-            if session_count > 9:
-                await self.finish_learning_session(query, context)
-                return
-            
-            # Add finish session button to keyboard if it's not a translation exercise
-            if exercise_data['keyboard'] and session_count >= 1:
-                finish_button = InlineKeyboardButton("Finish Session", callback_data="finish_session")
-                # Create new keyboard with existing buttons plus finish button
-                existing_buttons = exercise_data['keyboard'].inline_keyboard
-                new_keyboard = list(existing_buttons) + [[finish_button]]
-                exercise_data['keyboard'] = InlineKeyboardMarkup(new_keyboard)
-            
-            session_text = f"Word {session_count}/10\n\n{exercise_data['question']}"
+            # Initialize or increment word counter for model retraining
+            word_count = context.user_data.get('word_count', 0) + 1
+            context.user_data['word_count'] = word_count
             
             await query.edit_message_text(
-                session_text,
+                exercise_data['question'],
                 reply_markup=exercise_data['keyboard']
             )
     
@@ -223,28 +210,57 @@ class DutchVocabBot:
             # Update spaced repetition schedule (word_id is actually user_word_id)
             self.sr_manager.update_word_schedule(db, user_id, word_id, is_correct)
             
-            # Update ML models (word_id is actually user_word_id)
+            # Update ML models data (always update response time and bandit rewards)
             data_service = MLDataService(db)
-            self.progress_predictor.update_progress_and_retrain(data_service, user_id, word_id, session.response_time)
+            # Always update response time for progress tracking
+            if session.response_time:
+                data_service.update_word_response_time(word_id, session.response_time)
+            # Always update bandit rewards for exercise type optimization
             self.bandits.update_reward(data_service, user_id, word_id, exercise_type, is_correct, response_time)
             
+            # Check if we should retrain models (every 10 words)
+            word_count = context.user_data.get('word_count', 0)
+            if word_count > 0 and word_count % 10 == 0:
+                # Retrain progress predictor model
+                self.progress_predictor.train_model(data_service, user_id)
+                # Apply predictions to all user words
+                self.progress_predictor.apply_predictions_to_user_words(data_service, user_id)
+                
             db.commit()
             
-            # Show result
+            if word_count > 0 and word_count % 10 == 0:
+                # Send retraining notification
+                await query.edit_message_text("🧠 I just got better at suggesting you new words!")
+                # Small delay then continue
+                import asyncio
+                await asyncio.sleep(1.5)
+            
+            # Show result with word information
             correct_answer = user_word.english_translation if exercise_type.endswith('_to_en') else user_word.dutch_word
-            result_text = "✅ Correct!" if is_correct else f"❌ Incorrect. The answer was: {correct_answer}"
+            word_info = f"\n\n🇳🇱 {user_word.dutch_word} = 🇬🇧 {user_word.english_translation}"
+            result_text = ("✅ Correct!" if is_correct else f"❌ Incorrect. The answer was: {correct_answer}") + word_info
             
             keyboard = [
                 [InlineKeyboardButton("Next Word", callback_data="next_word")], 
-                [InlineKeyboardButton("Finish Session", callback_data="finish_session")]
+                [InlineKeyboardButton("Add Word", callback_data="add_word_menu")],
+                [InlineKeyboardButton("View Progress", callback_data="view_progress")],
+                [InlineKeyboardButton("Remove This Word", callback_data="remove_word")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            await query.edit_message_text(result_text, reply_markup=reply_markup)
+            # Check if we just showed retraining message
+            if word_count > 0 and word_count % 10 == 0:
+                # Show retraining message first, then the result
+                await query.edit_message_text("🧠 I just got better at suggesting you new words!")
+                import asyncio
+                await asyncio.sleep(1.5)
+                await query.edit_message_text(result_text, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text(result_text, reply_markup=reply_markup)
     
     async def show_progress(self, query, context):
         keyboard = [
-                [InlineKeyboardButton("Start Learning", callback_data="start_learning")],
+                [InlineKeyboardButton("Next Word", callback_data="next_word")],
                 [InlineKeyboardButton("Main Menu", callback_data="back_to_menu")]
             ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -352,11 +368,22 @@ class DutchVocabBot:
             # Update spaced repetition schedule
             self.sr_manager.update_word_schedule(db, user_id, current_word_id, is_correct)
             
-            # Update ML models
+            # Update ML models data (always update response time and bandit rewards)
             data_service = MLDataService(db)
-            self.progress_predictor.update_progress_and_retrain(data_service, user_id, current_word_id, session.response_time)
+            # Always update response time for progress tracking
+            if session.response_time:
+                data_service.update_word_response_time(current_word_id, session.response_time)
+            # Always update bandit rewards for exercise type optimization
             self.bandits.update_reward(data_service, user_id, current_word_id, exercise_type, is_correct, response_time)
             
+            # Check if we should retrain models (every 10 words)
+            word_count = context.user_data.get('word_count', 0)
+            if word_count > 0 and word_count % 10 == 0:
+                # Retrain progress predictor model
+                self.progress_predictor.train_model(data_service, user_id)
+                # Apply predictions to all user words
+                self.progress_predictor.apply_predictions_to_user_words(data_service, user_id)
+                
             db.commit()
             
             # Clear current exercise from context
@@ -365,14 +392,27 @@ class DutchVocabBot:
                 context.user_data.pop('current_exercise_type', None)
                 context.user_data.pop('exercise_start_time', None)
             
-            # Show result
+            # Show result with word information
             correct_answer = user_word.english_translation if exercise_type.endswith('_to_en') else user_word.dutch_word
-            result_text = "✅ Correct!" if is_correct else f"❌ Incorrect. The answer was: {correct_answer}"
+            word_info = f"\n\n🇳🇱 {user_word.dutch_word} = 🇬🇧 {user_word.english_translation}"
+            result_text = ("✅ Correct!" if is_correct else f"❌ Incorrect. The answer was: {correct_answer}") + word_info
             
-            keyboard = [[InlineKeyboardButton("Next Word", callback_data="next_word")]]
+            keyboard = [
+                [InlineKeyboardButton("Next Word", callback_data="next_word")],
+                [InlineKeyboardButton("Add Word", callback_data="add_word_menu")],
+                [InlineKeyboardButton("View Progress", callback_data="view_progress")],
+                [InlineKeyboardButton("Remove This Word", callback_data="remove_word")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
+            # Always show the result message for text input
             await update.message.reply_text(result_text, reply_markup=reply_markup)
+            
+            # Check if we should show retraining message after
+            if word_count > 0 and word_count % 10 == 0:
+                import asyncio
+                await asyncio.sleep(0.5)
+                await update.message.reply_text("🧠 I just got better at suggesting you new words!")
     
     async def add_word_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /add_word command to add custom vocabulary"""
@@ -412,34 +452,61 @@ class DutchVocabBot:
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Menu", callback_data="back_to_menu")]])
         )
     
-    async def finish_learning_session(self, query, context):
-        """Finish the current learning session"""
-        session_count = context.user_data.get('session_count', 0)
+    async def remove_current_word(self, query, context):
+        """Remove the current word from user's vocabulary"""
+        if not query.from_user:
+            return
+            
+        user_id = query.from_user.id
+        current_word_id = context.user_data.get('current_word_id')
+        dutch_word = context.user_data.get('current_word_dutch', 'Unknown')
+        english_word = context.user_data.get('current_word_english', 'Unknown')
         
-        # Clear session data
-        if context.user_data:
-            context.user_data.pop('current_word_id', None)
-            context.user_data.pop('current_exercise_type', None)
-            context.user_data.pop('exercise_start_time', None)
-            context.user_data.pop('session_count', None)
-        
-        session_text = f"🎉 Session completed! You practiced {session_count} words.\n\nGreat work! Regular practice helps with long-term retention."
-        
-        keyboard = [
-            [InlineKeyboardButton("Start New Session", callback_data="start_learning")],
-            [InlineKeyboardButton("View Progress", callback_data="view_progress")],
-            [InlineKeyboardButton("Main Menu", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(session_text, reply_markup=reply_markup)
+        if not current_word_id:
+            await query.edit_message_text("No current word to remove. Start learning first!")
+            return
+            
+        with next(get_db()) as db:
+            user_db = db.query(User).filter(User.telegram_id == user_id).first()
+            if not user_db:
+                await query.edit_message_text("User not found.")
+                return
+                
+            # Remove the word
+            user_word = db.query(UserWord).filter(UserWord.id == current_word_id).first()
+            if user_word:
+                db.delete(user_word)
+                db.commit()
+                
+                # Clear current word from context
+                if context.user_data:
+                    context.user_data.pop('current_word_id', None)
+                    context.user_data.pop('current_exercise_type', None)
+                    context.user_data.pop('exercise_start_time', None)
+                    context.user_data.pop('current_word_dutch', None)
+                    context.user_data.pop('current_word_english', None)
+                
+                keyboard = [
+                    [InlineKeyboardButton("Next Word", callback_data="next_word")],
+                    [InlineKeyboardButton("View Progress", callback_data="view_progress")],
+                    [InlineKeyboardButton("Main Menu", callback_data="back_to_menu")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"✅ Removed word: {dutch_word} ({english_word})",
+                    reply_markup=reply_markup
+                )
+            else:
+                await query.edit_message_text("Word not found.")
     
     async def show_main_menu(self, query, context):
         """Show the main menu"""
         keyboard = [
-            [InlineKeyboardButton("Start Learning", callback_data="start_learning")],
+            [InlineKeyboardButton("Next Word", callback_data="next_word")],
             [InlineKeyboardButton("View Progress", callback_data="view_progress")],
             [InlineKeyboardButton("Add Word", callback_data="add_word_menu")],
+            [InlineKeyboardButton("Remove Current Word", callback_data="remove_word")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         

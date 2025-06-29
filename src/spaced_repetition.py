@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_
 from data.models import User, UserWord, LearningSession
 
 class SpacedRepetitionManager:
@@ -19,104 +19,22 @@ class SpacedRepetitionManager:
         user = db.query(User).filter(User.telegram_id == user_telegram_id).first()
         if not user:
             return None
-        
-        # First, try to get words that are due for review
-        due_words = self._get_due_words(db, user.id)
-        if due_words:
-            # If we have a progress predictor, prioritize words with lowest mastery
-            if progress_predictor and len(due_words) > 1:
-                return self._prioritize_by_mastery(db, user.id, due_words, progress_predictor)
+        due_words: list[UserWord] = self._get_due_words(db, user.id)
+        if due_words: 
             return due_words[0]
-        
-        # If no due words, get a new word that hasn't been seen
-        new_word = self._get_new_word(db, user.id)
-        if new_word:
-            return new_word
-        
-        # If no new words, get words that need the most practice (lowest mastery)
-        if progress_predictor:
-            return self._get_lowest_mastery_word(db, user.id, progress_predictor)
-        
-        # Fallback: get the least recently seen word
-        return self._get_least_recent_word(db, user.id)
-    
-    def _prioritize_by_mastery(self, db: Session, user_id: int, words: list[UserWord], progress_predictor) -> UserWord:
-        """Select word with lowest predicted mastery from the given list"""
-        word_masteries = []
-        for word in words:
-            mastery = progress_predictor.predict_mastery(db, user_id, word.id)
-            word_masteries.append((word, mastery))
-        
-        # Sort by mastery (lowest first) and return the least mastered word
-        word_masteries.sort(key=lambda x: x[1])
-        return word_masteries[0][0]
-    
-    def _get_lowest_mastery_word(self, db: Session, user_id: int, progress_predictor) -> Optional[UserWord]:
-        """Get the word from user's vocabulary with lowest predicted mastery"""
-        # Get all words from user's vocabulary that have been seen at least once
-        candidate_words = db.query(UserWord).filter(
-            and_(
-                UserWord.user_id == user_id,
-                UserWord.is_active == True,
-                UserWord.times_seen > 0
-            )
-        ).all()
-        
-        if not candidate_words:
-            return None
-        
-        # Find word with lowest mastery
-        lowest_mastery = float('inf')
-        best_word = None
-        
-        for user_word in candidate_words:
-            mastery = progress_predictor.predict_mastery(db, user_id, user_word.id)
-            if mastery < lowest_mastery:
-                lowest_mastery = mastery
-                best_word = user_word
-        
-        return best_word
+        return None
     
     def _get_due_words(self, db: Session, user_id: int) -> list[UserWord]:
-        now = datetime.utcnow()
         
         # Get user words that are due for review (including those with null review dates)
         due_words = db.query(UserWord).filter(
             and_(
                 UserWord.user_id == user_id,
                 UserWord.is_active == True,
-                or_(
-                    UserWord.next_review_date <= now,
-                    UserWord.next_review_date.is_(None)
-                )
             )
-        ).order_by(UserWord.next_review_date.nulls_first()).all()
+        ).order_by(UserWord.next_review_date.nulls_first(), UserWord.mastery_level.nulls_first()).all()
         
         return due_words
-    
-    def _get_new_word(self, db: Session, user_id: int) -> Optional[UserWord]:
-        # Get words from user's vocabulary that they haven't seen yet
-        new_word = db.query(UserWord).filter(
-            and_(
-                UserWord.user_id == user_id,
-                UserWord.is_active == True,
-                UserWord.times_seen == 0
-            )
-        ).order_by(UserWord.id).first()
-        
-        return new_word
-    
-    def _get_least_recent_word(self, db: Session, user_id: int) -> Optional[UserWord]:
-        # Get the user word that was seen least recently
-        least_recent_word = db.query(UserWord).filter(
-            and_(
-                UserWord.user_id == user_id,
-                UserWord.is_active == True,
-                UserWord.times_seen > 0
-            )
-        ).order_by(UserWord.last_seen.asc()).first()
-        
-        return least_recent_word
     
     def update_word_schedule(self, db: Session, user_telegram_id: int, user_word_id: int, is_correct: bool):
         user = db.query(User).filter(User.telegram_id == user_telegram_id).first()

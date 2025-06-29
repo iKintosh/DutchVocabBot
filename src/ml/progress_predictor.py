@@ -60,6 +60,11 @@ class LearningProgressPredictor:
         X = np.array(features_list)
         y = np.array(targets)
         
+        # Check if we have both classes (0 and 1) for binary classification
+        unique_classes = np.unique(y)
+        if len(unique_classes) < 2:
+            return False  # Cannot train with only one class
+        
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
@@ -102,9 +107,9 @@ class LearningProgressPredictor:
         self.train_model(data_service, user_id)
         
         # Apply predictions to all user words
-        self._apply_predictions_to_user_words(data_service, user_id)
+        self.apply_predictions_to_user_words(data_service, user_id)
     
-    def _apply_predictions_to_user_words(self, data_service: MLDataService, user_id: int):
+    def apply_predictions_to_user_words(self, data_service: MLDataService, user_id: int):
         """Apply ML predictions to all user words after training"""
         if not self.is_trained:
             return

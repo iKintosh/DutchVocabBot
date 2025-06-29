@@ -4,7 +4,6 @@ import os
 import sys
 from dotenv import load_dotenv
 from data.models import create_tables
-from vocabulary_loader import initialize_vocabulary
 from bot import main as run_bot
 
 def setup_environment():
@@ -39,11 +38,6 @@ def main():
     print("Creating database tables...")
     create_tables()
     print("✅ Database tables created")
-    
-    # Initialize vocabulary
-    print("Initializing vocabulary...")
-    initialize_vocabulary()
-    print("✅ Vocabulary initialized")
     
     # Start the bot
     print("Starting Telegram bot...")
